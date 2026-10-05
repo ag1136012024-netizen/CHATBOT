@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 # 1. METADATOS Y CONFIGURACIÓN DE PÁGINA
 # ==========================================
 
-APP_VERSION = "v3.1 - Voz + Estado en vivo 🎤"
+APP_VERSION = "v4.0 - Voz + Estado en vivo 🎤"
 
 st.set_page_config(
     page_title="Friday - Tu Tutor Virtual",
