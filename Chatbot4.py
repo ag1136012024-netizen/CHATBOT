@@ -1,5 +1,6 @@
 import json
 import time
+from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -9,7 +10,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 # 1. METADATOS Y CONFIGURACIÓN DE PÁGINA
 # ==========================================
 
-APP_VERSION = "v4.0 - Voz + Estado en vivo 🎤"
+APP_VERSION = "v3.1 - Voz + Estado en vivo 🎤"
 
 st.set_page_config(
     page_title="Friday - Tu Tutor Virtual",
@@ -64,6 +65,21 @@ SYSTEM_PROMPTS = {
 }
 
 # ==========================================
+# 3.05 NUEVO: BASE DE CONOCIMIENTO (para "nutrir" a Friday)
+# ==========================================
+# Escribe información en el archivo conocimiento.txt (junto a este archivo)
+# y Friday la usará como referencia en sus respuestas.
+
+@st.cache_data
+def load_knowledge() -> str:
+    archivo = Path(__file__).parent / "conocimiento.txt"
+    if archivo.exists():
+        return archivo.read_text(encoding="utf-8").strip()
+    return ""
+
+KNOWLEDGE = load_knowledge()
+
+# ==========================================
 # 3.1 NUEVO: MENSAJES DE ESTADO VARIABLES
 # ==========================================
 # Lo que Friday "está haciendo" cambia según el modo y el tipo de pregunta.
@@ -112,38 +128,50 @@ def get_status_steps(mode: str, prompt: str) -> list[str]:
 # Funciona en Chrome y Edge (no en Firefox).
 
 VOICE_HTML = """
-<style>
-  body { margin:0; font-family: sans-serif; background: transparent; }
-  .wrap { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-  #mic {
-    background:#ff4b4b; color:#fff; border:none; border-radius:999px;
-    padding:9px 18px; font-size:15px; cursor:pointer;
-  }
-  #mic.on { background:#16a34a; animation: pulse 1.2s infinite; }
-  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(22,163,74,.6)} 70%{box-shadow:0 0 0 12px rgba(22,163,74,0)} 100%{box-shadow:0 0 0 0 rgba(22,163,74,0)} }
-  #state { font-size:13px; color:#888; }
-  #live { width:100%; font-size:14px; color:#888; min-height:18px; font-style:italic; }
-  @media (prefers-color-scheme: dark) { #live, #state { color:#bbb; } }
-</style>
-<div class="wrap">
-  <button id="mic">🎤 Dictar</button>
-  <span id="state">Listo para escucharte</span>
-  <div id="live"></div>
-</div>
 <script>
+(function () {
   const LANG = "__LANG__";
   const AUTO_SEND = __AUTO__;
-  const P = window.parent;   // la página de Streamlit
+  const P = window.parent;      // página de Streamlit
+  const D = P.document;
 
   const SR = P.SpeechRecognition || P.webkitSpeechRecognition ||
              window.SpeechRecognition || window.webkitSpeechRecognition;
 
-  const btn = document.getElementById("mic");
-  const stateEl = document.getElementById("state");
-  const liveEl = document.getElementById("live");
+  // Estilos del botón (se inyectan una sola vez en la página principal)
+  if (!D.getElementById("friday-mic-style")) {
+    const st = D.createElement("style");
+    st.id = "friday-mic-style";
+    st.textContent = `
+      #friday-mic {
+        width: 34px; height: 34px; border-radius: 50%; border: none;
+        background: transparent; cursor: pointer; font-size: 18px;
+        display: inline-flex; align-items: center; justify-content: center;
+        margin-right: 4px; flex-shrink: 0;
+      }
+      #friday-mic:hover { background: rgba(128,128,128,.25); }
+      #friday-mic.on { background: #16a34a; animation: fridayPulse 1.2s infinite; }
+      #friday-mic:disabled { opacity: .35; cursor: not-allowed; }
+      @keyframes fridayPulse {
+        0%   { box-shadow: 0 0 0 0 rgba(22,163,74,.6); }
+        70%  { box-shadow: 0 0 0 10px rgba(22,163,74,0); }
+        100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); }
+      }`;
+    D.head.appendChild(st);
+  }
+
+  // Quitar botón anterior (por si la página se recargó) y crear uno nuevo
+  const old = D.getElementById("friday-mic");
+  if (old) old.remove();
+
+  const btn = D.createElement("button");
+  btn.id = "friday-mic";
+  btn.type = "button";
+  btn.title = "Dictar por voz";
+  btn.textContent = "🎤";
 
   function getInput() {
-    return P.document.querySelector('textarea[data-testid="stChatInputTextArea"]');
+    return D.querySelector('textarea[data-testid="stChatInputTextArea"]');
   }
   function setInput(text) {
     const ta = getInput();
@@ -152,64 +180,78 @@ VOICE_HTML = """
     setter.call(ta, text);
     ta.dispatchEvent(new P.Event("input", { bubbles: true }));
   }
+  function setPlaceholder(text) {
+    const ta = getInput();
+    if (ta) ta.placeholder = text;
+  }
   function sendInput() {
-    const send = P.document.querySelector('button[data-testid="stChatInputSubmitButton"]');
+    const send = D.querySelector('button[data-testid="stChatInputSubmitButton"]');
     if (send) send.click();
   }
 
+  // Colocar el botón dentro de la barra de escribir, junto al botón de enviar
+  function place() {
+    const send = D.querySelector('button[data-testid="stChatInputSubmitButton"]');
+    if (send && btn.parentElement !== send.parentElement) {
+      send.parentElement.insertBefore(btn, send);
+    }
+  }
+  place();
+  setInterval(place, 400);   // por si Streamlit redibuja la barra
+
   if (!SR) {
     btn.disabled = true;
-    stateEl.textContent = "Tu navegador no soporta dictado. Usa Chrome o Edge.";
-  } else {
-    const rec = new SR();
-    rec.lang = LANG;
-    rec.continuous = true;
-    rec.interimResults = true;
-
-    let listening = false;
-    let finalText = "";
-
-    rec.onstart = () => {
-      listening = true;
-      btn.classList.add("on");
-      btn.textContent = "⏹️ Detener";
-      stateEl.textContent = "🔴 Escuchando...";
-    };
-
-    rec.onresult = (event) => {
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const t = event.results[i][0].transcript;
-        if (event.results[i].isFinal) finalText += t + " ";
-        else interim += t;
-      }
-      const full = (finalText + interim).trim();
-      liveEl.textContent = full ? "📝 " + full : "";
-      setInput(full);                // escritura en tiempo real en la caja del chat
-    };
-
-    rec.onerror = (e) => {
-      stateEl.textContent = e.error === "not-allowed"
-        ? "⚠️ Permite el acceso al micrófono en el navegador."
-        : "⚠️ Error de voz: " + e.error;
-    };
-
-    rec.onend = () => {
-      listening = false;
-      btn.classList.remove("on");
-      btn.textContent = "🎤 Dictar";
-      stateEl.textContent = "Listo para escucharte";
-      const text = finalText.trim();
-      if (AUTO_SEND && text) setTimeout(sendInput, 350);
-      finalText = "";
-      liveEl.textContent = "";
-    };
-
-    btn.onclick = () => {
-      if (listening) { rec.stop(); }
-      else { finalText = ""; setInput(""); try { rec.start(); } catch (e) {} }
-    };
+    btn.title = "Tu navegador no soporta dictado. Usa Chrome o Edge.";
+    return;
   }
+
+  const rec = new SR();
+  rec.lang = LANG;
+  rec.continuous = true;
+  rec.interimResults = true;
+
+  let listening = false;
+  let finalText = "";
+  const defaultPlaceholder = "Escribe o dicta tu duda aquí...";
+
+  rec.onstart = () => {
+    listening = true;
+    btn.classList.add("on");
+    btn.title = "Detener dictado";
+    setPlaceholder("🔴 Escuchando... habla ahora");
+  };
+
+  rec.onresult = (event) => {
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const t = event.results[i][0].transcript;
+      if (event.results[i].isFinal) finalText += t + " ";
+      else interim += t;
+    }
+    setInput((finalText + interim).trim());   // escritura en tiempo real
+  };
+
+  rec.onerror = (e) => {
+    setPlaceholder(e.error === "not-allowed"
+      ? "⚠️ Permite el micrófono en el navegador"
+      : "⚠️ Error de voz: " + e.error);
+  };
+
+  rec.onend = () => {
+    listening = false;
+    btn.classList.remove("on");
+    btn.title = "Dictar por voz";
+    setPlaceholder(defaultPlaceholder);
+    const text = finalText.trim();
+    if (AUTO_SEND && text) setTimeout(sendInput, 350);
+    finalText = "";
+  };
+
+  btn.onclick = () => {
+    if (listening) { rec.stop(); }
+    else { finalText = ""; setInput(""); try { rec.start(); } catch (e) {} }
+  };
+})();
 </script>
 """
 
@@ -217,7 +259,11 @@ def voice_dictation(lang: str, auto_send: bool):
     html = (VOICE_HTML
             .replace("__LANG__", lang)
             .replace("__AUTO__", "true" if auto_send else "false"))
-    components.html(html, height=95)
+    # Streamlit nuevo usa st.iframe; si no existe, usamos el método anterior
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=1)
+    else:
+        components.html(html, height=1)
 
 # ==========================================
 # 4. BARRA LATERAL (SETTINGS Y HERRAMIENTAS)
@@ -320,7 +366,9 @@ def get_llm(model_name: str, temp: float):
         model=model_name,
         google_api_key=API_KEY,
         temperature=temp,
-        streaming=True
+        streaming=True,
+        timeout=60,
+        max_retries=2
     )
 
 llm = get_llm(selected_model, temperature)
@@ -367,6 +415,11 @@ if prompt := st.chat_input("Escribe o dicta tu duda aquí..."):
 
     # 2. Construir el historial para LangChain
     active_system_prompt = SYSTEM_PROMPTS[tutor_mode]
+    if KNOWLEDGE:
+        active_system_prompt += (
+            "\n\nINFORMACIÓN DE REFERENCIA (úsala cuando sea relevante y "
+            "tenla por más confiable que tu memoria):\n" + KNOWLEDGE
+        )
     history = [SystemMessage(content=active_system_prompt)]
 
     for message in st.session_state.messages:
@@ -410,6 +463,14 @@ if prompt := st.chat_input("Escribe o dicta tu duda aquí..."):
                 full_response += text
                 response_placeholder.markdown(full_response + "▌")
 
+            # Si el modelo no devolvió texto (p. ej. bloqueó el tema), avisar en vez de quedarse mudo
+            if not full_response.strip():
+                full_response = (
+                    "🤔 No pude generar una respuesta para eso. "
+                    "Puede ser que el tema esté restringido (por ejemplo, letras completas de canciones). "
+                    "¿Probamos reformulando la pregunta?"
+                )
+
             # Renderizado final limpio sin cursor
             response_placeholder.markdown(full_response)
 
@@ -423,6 +484,11 @@ if prompt := st.chat_input("Escribe o dicta tu duda aquí..."):
             )
             if status_box:
                 status_box.update(label="❌ Ocurrió un error", state="error", expanded=True)
+            st.error(full_response)
+
+    # 4. Guardar respuesta del asistente en el historial
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
+
             st.error(full_response)
 
     # 4. Guardar respuesta del asistente en el historial
